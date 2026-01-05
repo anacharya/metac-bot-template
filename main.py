@@ -4,6 +4,58 @@ import logging
 from datetime import datetime, timezone
 from typing import Literal
 
+import os
+import json
+import requests
+import re
+import numpy as np
+import csv
+import time
+import logging
+import io
+from collections import defaultdict
+import sys
+
+from asknews_sdk import AskNewsSDK        
+from openai import OpenAI                 
+from newscatcherapi import NewsCatcherApiClient  
+
+# Load API keys from environment variables
+ASKNEWS_CLIENT_ID = os.environ.get("ASKNEWS_CLIENT_ID")
+ASKNEWS_SECRET = os.environ.get("ASKNEWS_SECRET")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+METACULUS_TOKEN = os.environ.get("METACULUS_TOKEN")
+NEWSCATCHER_API_KEY = os.environ.get("NEWSCATCHER_API_KEY")
+NYT_API_KEY = os.environ.get("NYT_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
+
+def test_newscatcher():
+    if not NEWSCATCHER_API_KEY:
+        print("❌ NEWSCATCHER_API_KEY not set")
+        return
+
+    url = "https://api.newscatcherapi.com/v2/search"
+    headers = {
+        "x-api-key": NEWSCATCHER_API_KEY
+    }
+    params = {
+        "q": "AI",
+        "lang": "en",
+        "page_size": 3
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    
+    if response.status_code == 200:
+        data = response.json()
+        print("✅ NewsCatcher test successful. Sample articles:")
+        for article in data.get("articles", []):
+            print("-", article.get("title"))
+    else:
+        print(f"❌ NewsCatcher test failed: {response.status_code}")
+        print(response.text)
+
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -31,6 +83,744 @@ from forecasting_tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+##################################### PROMPTS #####################################
+Singleshot_Research_Memo = """
+    I am a professional forecaster. My goal is to make an accurate prediction
+    on an important question. Here is some information about the question I am trying to forecast:
+
+    Before I do any forecasting, I am going to have a research assitant gather some
+    factual analysis / information for me.  That's where I need your help.
+
+    Given the question I describe below, can you write **one** succicient question
+    for the research assistant to work on? In other words, what's the most important
+    thing one needs to know to make this prediction? The question should be factual
+    in nature -- things you can look up in news sources, encyclopedia's, press releases,
+    on the internet, etc.
+
+    The question is:
+    {title}
+
+    Here is some background information:
+    {background}
+
+    Here is how the question will get resolved:
+    {resolution_criteria}
+
+    Here is the fine print on the question:
+    {fine_print}
+
+    Today is {today}.
+
+    I have pulled a bunch of recent news articles related to the question so you have
+    access to some of the latest news:
+
+    {hotnews}
+
+    Two key things to keep in mind:
+
+    1) Don't over-complicate it.  Often the key thing you need to know is pretty simple.
+    For instance in predicting who will win a political contest the key thing to know is
+    the latest polling.  In predicting where a stock price will end up, the key thing to know
+    is where the stock price is today.
+
+    2) Your question shouldn't be about the future -- it shouldn't require a prediction.  It should
+    be something we can know in the present that will help the forecaster make the prediction.
+
+    Thanks for all your hard work.
+
+    """
+
+Multishot_Research_Memo = """
+    I am a professional forecaster. My goal is to make an accurate prediction
+    on an important question. Here is some information about the question I am trying to forecast:
+
+    Before I do any forecasting, I am going to have a research assitant gather some
+    factual analysis / information for me.  That's where I need your help.
+
+    Given the question I need to forecast and the background -- as well as everything
+    you know about forecasting -- what are three or four questions the research assistant
+    could help with. These questions should primarily be factual in nature -- things you can
+    look up in news sources, encyclopedia's, press releases, on the internet, etc.
+
+    The question I need to forecast is:
+    {title}
+
+    Here is some background information:
+    {background}
+
+    Here is how the question gets resolved:
+    {resolution_criteria}
+
+    Here is the fine print on the question:
+    {fine_print}
+
+    Today is {today}.
+
+    Your questions shouldn't be about the future -- it shouldn't require a prediction.  It should
+    be something we can know in the present that will help the forecaster make the prediction.
+
+    Thanks for all your hard work.
+
+    """
+
+Perplexity_Memo = """
+    I am a professional forecaster. My goal is to make an accurate prediction
+    on an important question. I need your help with some research.
+
+    Here is a question or questions that I need you to answer using the factual information at your disposal.
+    {gpt_question}
+
+    ****The above is what I need you to work on****
+
+    The rest of this is background and instructions.
+    Here is some background information about the question I am trying to forecast:
+
+    Here is what I am trying to forecast:
+    {title}
+
+    Here is some background information on the forecast:
+    {background}
+
+    Here is how the forecast gets resolved:
+    {resolution_criteria}
+
+    Here is the fine print on the question:
+    {fine_print}
+
+    Today is {today}.
+
+    Please generate a factbase answer to the question for me.
+
+    You do **not** need to generate a forecast on the question.  That's for someone else to do.  I need you to do factual research.
+
+    To answer the question or questions, feel free to use the information from the background or fineprint herein -- that is reliable information.
+    You can also use information from the internet that you have access to.
+
+    Please start your answer by restating the question.
+
+    Where possible please cite your sources.
+
+    Be mindful that when the researchers says "current" they mean as close to today as possible.
+
+    Thanks for all your hard work.
+
+    """
+
+Grading_Instructions = """
+    I need your help evaluating some research.
+
+    Here is the question I needed answered:
+    {rschquestion}
+
+    This is the research memo I received from my assistant:
+    {rschquestion_answer}
+
+    Today is {today}
+
+    Does the research answer the question or questions?  Please provide a score between 0 and 100
+    where 100 is perfect, 70 is passing, and 0 is completely missed the mark.
+
+    This is not about effort or goodwill -- it's literally about whether the memo provided contain the answer.
+    Your grade will help me determine whether I can use it in my project.
+
+    Output your response in the following JSON structure:
+    {{
+    "rationale": "string",
+    "grade": "integer between 0 and 100"
+    }}
+
+    Thanks for all your hard work.
+
+    """
+
+Keyword_Generator = """
+    I need your help using a search engine.  The search engine can only accept key words.
+    It cannot accept whole questions or sentences. I am going to give you a whole question and I need you
+    to convert it into keywords that capture the main topics of the question.
+
+    Here is the question:
+    {title}
+
+    Do not include any date information such as the month or year in your answer.
+
+    Your response cannot be more than four words or the engine won't work.  It's fine if it's fewer words -- three is ideal.
+
+    Try to make the words as clear and simple as possible.  For instance, don't use the word Russo -- use the word Russia or Russian.  Simple language wins.
+
+    Output your response in the following JSON structure:
+    {{
+    "keywords": "2 to 4 words"
+    }}
+
+    """
+
+NEWS_CLEANUP_PROMPT = """
+    You are a professional editor.
+
+    I have pulled articles from a database but they are in a messy format.  I need them formatted
+    in a standard way so that I can compare them to other articles.
+
+    *****Here is what each article should look like:
+    [1]:
+    Title: Zelenskyy Hopes for End to War with Russia by 2025
+    Summary: Ukrainian President Volodymyr Zelenskyy expressed his hope that the war with Russia will end by 2025 during his visit to Berlin, where he called for continued military support for his country. Zelenskyy met with German Chancellor Olaf Scholz and thanked Germany for its support, saying 'It is very important for us that these aid does not decrease next year.' He also presented his 'Plan for Victory' in the war, expressing his hope that the conflict will end 'by next year 2025.' Scholz assured that Germany and European partners will send more defensive equipment to Ukraine this year, and that Germany will provide 4 billion euros in aid to Ukraine in 2025, vowing 'not to retreat from our support for Ukraine.' Zelenskyy agreed that a conference for peace including Russia is necessary, but also emphasized that 'peace can only be achieved based on international law.' Scholz stated that 'we will not accept a peace imposed by Russia.' Zelenskyy also met with Pope Francis in the Vatican, who called for peace in Ukraine, and with French President Emmanuel Macron in Paris, who emphasized the importance of continued support for Ukraine.
+    Excerpt: Ukraine's President Volodymyr Zelensky said, 'No nation should face such trials alone.' Russia continues its military invasion of Ukraine, which began on February 24, 2022, at the order of Vladimir Putin. Putin announced the start of the war against Ukraine on February 24, 2022, calling it a 'special military operation in Donbass' aimed at protecting people who 'have been subjected to genocide by the Kiev regime for eight years.' However, the EU and the UN have previously disputed Putin's claims of genocide. Western politicians have accused Putin of lying. Zelensky has announced the break of diplomatic relations with Russia.
+    Source: CNBC.com
+    Published Date: November 10 2024 20:53
+
+    Here are the articles from the database:
+    {news_articles}
+
+    Here are the steps I need you to follow to format the articles:
+    1. If the articles come in a JSON format or a continious string, break them into separate articles.  Each article usually starts with "Title."
+    2. For all the articles, format / organize them similarly -- using the format above.
+    3. For each article, please include the title, summary, excerpt (if available), media source, and published date.
+    4. The summary and the excerpt should be exactly as they appear in the "clip" you recevied.  Do not truncate / edit them in anyway.
+    5. There is no need to include the other fields in your final response.
+    6. If you're missing data for any required field, just leave it blank.
+    7. You should return a well formatted text string.  Do not return JSON format.
+
+    I would prefer you clean up all of them but if you need to cut your work short, either
+    clean-up all of them or do at least 20.
+
+    Thanks for all your hard work.
+
+    """
+
+HOTNEWS_RANKED_PROMPT = """
+    You are a professional researcher, who works for a forecaster.  The forecaster is workking
+    on the following question:
+
+    {title}
+
+    Today is {today}.
+
+    As part of the forecasting process, the researcher pulled articles from two different media databases.
+    All the articles are from the past 48 to 72 hours.
+
+    ****I need you to read through all the articles from the database and send back the
+    most relevant ones given the question the forecaster is working on.****
+
+    Here are the articles from the first database which is called AskNews:
+    {hotnews_asknews_cleaned}
+
+    Here are the articles from the second database which is called NewsCatcher:
+    {hotnews_newscatcher_cleaned}
+
+    Here are the steps you should follow:
+    1) Read each article.
+    2) Eliminate any duplicate articles.
+    3) Eliminate anything that is mostly opinion based.
+    4) Score each articles in terms of whether it provides relevant and timely information to forecast on the question above.
+    5) Score the article in terms of the quality of the news source -- the higher the quality of the newssource the better.
+    6) Rank all the articles using the infomration from step 4 and 5.
+    7) Pick a handfull of the best articles given the question the forecaster is working on.
+    8) Add a field to each article for which database -- AskNews, NewsCatcher, etc. -- that it's coming from.
+    9) Count the number of articles you were given and the the number of articles you're returning.
+
+    Typically you will return between 10 and 15 articles mixed across the two databases. But your answer can vary.
+    If nothing is relevant, return zero.  If lots are relevant, return more.
+
+    Do **not** make up any content.  Only use the materials you were provied to generate your list.
+
+    For the articles you return, they should be returned in a well formatted text string like this:
+    *****Here is what each article should look like:
+    [1]:
+    Title: Zelenskyy Hopes for End to War with Russia by 2025
+    Summary: Ukrainian President Volodymyr Zelenskyy expressed his hope that the war with Russia will end by 2025 during his visit to Berlin, where he called for continued military support for his country. Zelenskyy met with German Chancellor Olaf Scholz and thanked Germany for its support, saying 'It is very important for us that these aid does not decrease next year.' He also presented his 'Plan for Victory' in the war, expressing his hope that the conflict will end 'by next year 2025.' Scholz assured that Germany and European partners will send more defensive equipment to Ukraine this year, and that Germany will provide 4 billion euros in aid to Ukraine in 2025, vowing 'not to retreat from our support for Ukraine.' Zelenskyy agreed that a conference for peace including Russia is necessary, but also emphasized that 'peace can only be achieved based on international law.' Scholz stated that 'we will not accept a peace imposed by Russia.' Zelenskyy also met with Pope Francis in the Vatican, who called for peace in Ukraine, and with French President Emmanuel Macron in Paris, who emphasized the importance of continued support for Ukraine.
+    Excerpt: Ukraine's President Volodymyr Zelensky said, 'No nation should face such trials alone.' Russia continues its military invasion of Ukraine, which began on February 24, 2022, at the order of Vladimir Putin. Putin announced the start of the war against Ukraine on February 24, 2022, calling it a 'special military operation in Donbass' aimed at protecting people who 'have been subjected to genocide by the Kiev regime for eight years.' However, the EU and the UN have previously disputed Putin's claims of genocide. Western politicians have accused Putin of lying. Zelensky has announced the break of diplomatic relations with Russia.
+    Source: CNBC.com
+    Published Date: November 10 2024 20:53
+
+    Your final output should be three things:
+    1) The 10 to 15 articles that are most relevant from this batch. Those articles should appear in the format you received them.  It should be a well formatted text string.
+    2) The number of articles you were provided -- essentionally the sum of the articles from AskNews and NewsCatcher.  This will be number_of_articles_provided.
+    3) The number of articles you are returning.  This will be number_of_articles_returned.
+
+    Output your response in the following JSON structure:
+    {{
+    "hot_news_ranked": "text string",
+    "number_of_articles_provided": "integer",
+    "number_of_articles_returned": "integer",
+    }}
+
+    Thanks for all your hard work.
+
+    """
+
+Baserate_Research_Memo = """
+    I am a professional forecaster. My goal is to make an accurate prediction
+    on an important question. Here is some information about the question I am trying to forecast:
+
+    Before I do any forecasting, I need to understand the baserates for this question.
+
+    The question is:
+    {title}
+
+    Here is some background information:
+    {background}
+
+    Here is how the question gets resolved:
+    {resolution_criteria}
+
+    Here is the fine print on the question:
+    {fine_print}
+
+    Today is {today}.
+
+    I have pulled a bunch of recent news articles related to the question so you have
+    some of the latest news to help you:
+
+    {hotnews}
+
+    Baserates are super important in forecasting:
+
+    Base rates are the statistical likelihood of an event happening based on historical
+    data or a general population. They are important in forecasting because they provide
+    an objective starting point, preventing predictions from being overly influenced by
+    specific, often unreliable, details. For example, if 70% of startups fail within the
+    first five years, using that base rate helps ground predictions about a new startup’s
+    likelihood of success, before adjusting for its specific characteristics.
+
+    Given the question and backhground I describe above, can you write 4 succicient questions
+    about specific baserates you would want to know to be able to forecast on this question.
+    I will then have a researcher go find the answer to these questions.
+
+    Don't over-complicate it.  Often the key things you need to know are pretty simple.
+
+    Output your response in the following JSON structure:
+    {{
+    "Question1": "Your first base-rate question in one sentence or so."
+    "Question2": "Your second base-rate question in one sentence or so."
+    "Question3": "Your third base-rate question in one sentence or so."
+    "Question4": "Your fourth base-rate question in one sentence or so."
+    }}
+
+    Thanks for all your hard work.
+
+    """
+
+BACKGROUND_RANK_PROMPT = """
+    You are a professional researcher, who works for a forecaster.  The forecaster is workking
+    on the following question:
+
+    {title}
+
+    Today is {today}.
+
+    As part of the forecasting process, the researcher pulled articles from three different media databases.
+
+    ****I need you to read through all the articles from the database and send back the
+    most relevant ones given the question the forecaster is working on.****
+
+    Here are the articles from the first database which is called NewsCatcher:
+
+    {newscatcher_articles}
+
+    Here are the articles from the first database which is called New York Times:
+
+    {nyt_articles}
+
+    Here are the articles from the first database which is called AskNews:
+
+    {background_asknews}
+
+    Here's some steps you should follow:
+    1) Read each article.
+    2) Eliminate anything that is mostly opinion based.
+    3) Eliminate any duplicate articles.
+    4) Score the article in terms of whether it provides relevant background information to forecast on the question above.
+    5) Score the article in terms of the quality of the news source -- the higher the quality of the newssource the better.
+    6) Of the 100 or so articles you're reviewing pick out 10 - 20 that score highly on the above criterion
+    7) Don't worry about breaking news.  There is another team working on breaking news / latest news so you don't need to worry about that.
+    8) Count the number of articles you were given and count the number of articles you're returning.
+
+    The goal is to provide the forecaster with broadly relevant information -- very useful background information to forecast on the question..
+
+    For the articles you return, you should keep the exact same formatting / material that you received them in.  If you selected the entry, do not truncate / edit it.
+    Remember it's critical to include the full entry for each article you select -- DO NOT SHORTEN THEM or eliminate materials.
+
+    Please note for each entry which database it came from: NewsCatcher, New York Times, AskNews.
+
+    For the articles you return, they should be returned in a well formatted text string like this:
+    *****Here is what each article should look like:
+    [1]:
+    Title: Zelenskyy Hopes for End to War with Russia by 2025
+    Summary: Ukrainian President Volodymyr Zelenskyy expressed his hope that the war with Russia will end by 2025 during his visit to Berlin, where he called for continued military support for his country. Zelenskyy met with German Chancellor Olaf Scholz and thanked Germany for its support, saying 'It is very important for us that these aid does not decrease next year.' He also presented his 'Plan for Victory' in the war, expressing his hope that the conflict will end 'by next year 2025.' Scholz assured that Germany and European partners will send more defensive equipment to Ukraine this year, and that Germany will provide 4 billion euros in aid to Ukraine in 2025, vowing 'not to retreat from our support for Ukraine.' Zelenskyy agreed that a conference for peace including Russia is necessary, but also emphasized that 'peace can only be achieved based on international law.' Scholz stated that 'we will not accept a peace imposed by Russia.' Zelenskyy also met with Pope Francis in the Vatican, who called for peace in Ukraine, and with French President Emmanuel Macron in Paris, who emphasized the importance of continued support for Ukraine.
+    Excerpt: Ukraine's President Volodymyr Zelensky said, 'No nation should face such trials alone.' Russia continues its military invasion of Ukraine, which began on February 24, 2022, at the order of Vladimir Putin. Putin announced the start of the war against Ukraine on February 24, 2022, calling it a 'special military operation in Donbass' aimed at protecting people who 'have been subjected to genocide by the Kiev regime for eight years.' However, the EU and the UN have previously disputed Putin's claims of genocide. Western politicians have accused Putin of lying. Zelensky has announced the break of diplomatic relations with Russia.
+    Source: CNBC.com
+    Published Date: November 10 2024 20:53
+    Database: New York Times OR AskNews OR NewsCatcher
+    *****
+
+    Your final output should be three things:
+    1) The articles that are most relevant from this batch. Those articles should appear in the format you received them.
+    2) The number of articles you were provided -- essentionally the sum of the articles from AskNews and NewsCatcher.  This will be number_of_articles_provided.
+    3) The number of articles you are returning.  This will be number_of_articles_returned.
+
+    Output your response in the following JSON structure:
+    {{
+    "background_news_ranked": "text string",
+    "number_of_background_articles_provided": "integer",
+    "number_of_background_articles_returned": "integer",
+    }}
+
+    Thanks for all your hard work.
+
+    """
+
+Score_Overall_Research_Prompt = """
+    I need your help evaluating some research.
+
+    I am a forecaster and I need to forecast this question:
+    {title}
+
+    I have had a team of researchers put together the following information to help me forecast this question:
+
+    Here is the latest news on the topic:
+    {hot_news_ranked}
+
+    Here is some background news on the topic:
+    {background_news_ranked}
+
+    Here is the answer to the most important question -- in their view -- for forecasting on this question:
+    {one_shot_rschquestion_answer}
+
+    Here is a research memo on the topic:
+    {multishot_rschquestion_answer}
+
+    I also asked them to determine the key baserates that we need to know and to find the data.
+
+    Here is the first baserate quesiton and answer:
+    {baserate1}
+
+    Here is the second baserate quesiton and answer:
+    {baserate2}
+
+    Here is the third baserate quesiton and answer:
+    {baserate3}
+
+    Here is the fourth baserate quesiton and answer:
+    {baserate4}
+
+    I need you to do the following:
+    1) Review all of this research.
+    2) Think about how well it answers each of the questions posed.
+    3) Then think overall about whether I have what I need to forecast on this question
+    If one has poor quality inputs / information / data the forecast will be wrong. Specifically:
+    -->What questions do you think I need to have answer to to forecast this question?
+    -->What questions do I have answers to?
+    4) Please provide a score between 0 and 100
+    where 100 is perfect, 70 is passing, and 0 is completely missed the mark.
+
+    This is not about effort or goodwill -- it's literally about whether the memo provided containts the answers.
+    Your grade will help me determine whether I can use it in my project.
+
+    Your out put will have three parts:
+    1) What is the score as described in point 4 above?
+    2) Should I proceed with my forecast or should I have the researcher do more work?
+    3) What is your rational for these answers?
+
+
+    Output your response in the following JSON structure:
+    {{
+    "score": "integer between 0 and 100",
+    "proceed": "boolean",
+    "rationale": "string"
+    }}
+
+    Thanks for all your hard work.
+
+    """
+
+NYT_Cleanup = """
+    I need your help cleaning up a data dump from the NYT database.  Here is a bunch of info
+    from a search I did:
+    {text_string}
+
+    Unfortunately, it's got lots of distracting junk in it.  Can you clean it up?
+
+    Here are some instructions:
+    1) There are about ten articles here.  Find them.
+    2) For each, pull out the title, abstract, snippet, lead paragraph, source, pubulication date.
+    3) Generally I'm looking for the substantive parts of the article.
+    4) Delete ***everything else***
+
+    One thing I'm trying to do is dramatically shorten the file.  It can only be a few pages long.
+    If it's more than that, please cut it down.
+
+    Please return a well formatted text string.
+
+    """
+
+OPENAI_PROMPT_TEMPLATE = """
+    You are a professional forecaster, and I need your help making a prediction.
+
+    Your goal is to make an accurate prediction. To do this, you evaluate past data
+    and trends carefully, take into account base rates about how similar events unfolded in the past,
+    synthesize key informaiton, and outline the best reasons for and against a
+    particular outcome, among other steps.
+
+    You know that great forecasters don't just forecast according to the "vibe" of the question -- they do the work.
+    They think about the question in a structured way, record their
+    reasoning as they go, and they always consider multiple perspectives.
+
+    You are trying to give the most accurate probability.  There is no advantage to hedging.
+    Your answer will be evaluated later when actual events unfold.
+
+    Here is some information about the question.
+
+    The question is:
+    {title}
+
+    Here is some background on the question:
+    {background}
+
+    Here is how the question gets resolved:
+    {resolution_criteria}
+
+    Here is the fine print on the question:
+    {fine_print}
+
+    Today is {today}.
+
+    Let's now go through some steps that good forecasters use to answer a question.
+
+    I am going to layout some questions I would like you to answer and to think
+    about before you give a final probability. You should give an explicit answer to all
+    of these questions -- and think about them carefully -- before you give your
+    probablity. Showing your work will help you develop a better answer.
+
+    1. Given the question above, please rephrase and expand the question to help
+    you do a better job answering it.  Maintain all of the information in the
+    original question but restate it in your own words.
+
+    2. Focus on the "resolution criterion" for the question.  It often
+    contains important definitions that should be considered. For instance,
+    sometimes the question will make a general point and the fine print will make it much more specific.
+    Considering the resolution criterion provided to you above, how do you think that impacts the probabilities of a given
+    outcome here? If helpful, restate the question more precisely based on the fine print and resolution criterion.
+
+    3. Do you same thing with Fine Print.  Focus on the fine print for the question.  It often
+    contains important definitions and edge cases that should be considered. For instance, the fine
+    print might allow for a softer standard for resolution than the resolution criterion.
+    Considering the fine-print provided to you above, how do you think that impacts the probabilities of a given
+    outcome here? If helpful, restate the question more precisely based on the fine print and resolution criterion.
+
+
+    4. I asked a research assistant to pull headlines from the past
+    48 hours related to the question you're trying to forecast. This is the breaking news
+    related to the topic.  If might not provide the broadest context but
+    it is up-to-date and critical for you to consider. Here are the headlines and a summary of each article:
+
+    {hot_news_ranked}.
+
+    Think about how this material shapes your forecast and write down what you think.
+
+    5. I hired a research assistant to help gather information and facts for your forecast.
+    His first piece of research answers the one critical question that I believe you need to know
+    the answer to in order to make a forecast on this question. There are certainly other important questions
+    to answer but this information is the most important question and it's answer:
+
+    {one_shot_rschquestion_answer}
+
+    Think about how the answer here shapes your forecast and write down your answer.
+
+    6. It's often said that baserates are critical to forecasting so your researcher
+    put together four baserates questions and their answers. Here's a
+    good definition of base rate: a base rate is the likelihood of an event
+    occurring based on historical data. Your researcher developed several base rate questions
+    based on the question you're trying to forecast.
+
+    Baserate question 1 and its answer:
+    {baserate1}
+
+    Baserate question 2 and its answer:
+    {baserate2}
+
+    Baserate question 3 and its answer:
+    {baserate3}
+
+    Baserate question 4 and its answer:
+    {baserate4}
+
+    Think about how the answer to this question shapes your forecast and write down your answer.
+
+    7. I hired a second researcher to help gather a broader set of information and facts for your forecast.
+    In this case, I generated three or four important questions related to the forecast
+    and asked him to find the answers.  Here is that work:
+
+    {multishot_rschquestion_answer}
+
+    Again, think about how the answer to this question shapes your forecast and write down your answer.
+
+    8. I also thought it would be useful for you to have some background articles and other reporting on the question.
+    So I asked another research assistant to pull some headlines and article summaries from
+    a wide range of media sources related to the question you're trying to forecast. These were selected
+    due to their broad relevance to the topic and they come from a wide time-range ... so be careful with them.
+    Be keenly aware that events and circumstances may supersede some of these articles.  They are meant to be
+    broadly relevant -- not the most current. The database he used has articles from the last year.
+
+    Here are the titles, a summary, and some extracts:
+
+    {background_news_ranked}
+
+    Think about how these materials shape your forecast and write down your answer.
+
+    *****That's the background material I have for you.  Let's now do some more work to develop a forecast.******
+
+    9. The time element is always super important in prediction.  So make sure you know
+    today's date -- it's listed above.  Then answer these questions:
+    a. How much time is left in days until the question resolves?
+    b. Think about the default resolution: if the question resolved today how
+    would it resolve?
+    c. What kind of rate of change is required for the question to resolve "yes"?
+    d. What kind of rate of change is required for the question to resolve "no"?
+    c. What would you forecast if there was only a quarter of the time left?
+    d. What would you forecast if there was 4x the time left?
+
+    10. Using your knowledge of the topic and the information provided above, list a few reasons
+    why the answer might be NO.  List them in order of important.  Rate the strength of each reason.
+
+    11. Using your knowledge of the topic and the information provided above, list a few reasons
+    why the answer might be YES.  List them in order of important.  Rate the strength of each reason.
+
+    12. Now aggregate your considerations.  Think like a superforecaster (e.g., Nate
+    Silver, Phil Tetlock).  Based on everything you've learning in steps 1 through 11,
+    give us your best answer.
+
+    14. Evaluate whether your calculated probability is excessively confident or not confident enough.
+    Think carefully about this question.   Also, consider anything else you might have missed.
+    This is your opportunity to pause and reflect on your work so far.  Do any revisions make sense?
+
+    As a reminder here is the question you are forecasting: {title}
+
+    *****What is the probablity that the question will resolve {direction}?*****
+
+    You should aggregate your answer into a probability between 0% (very, very unlikely) and 100% (very, very likely).
+
+    You should always provide a number. The number can be very low or very high. Don't be
+    afraid to go to the extremes if your analysis suggests so. Just be accurate.
+
+    Follow these steps when generating your output:
+
+    1) **SHOW YOUR WORK** Provide your analysis based on each of the steps described above i.e., write out an answer to each step.
+    Then given the question, all the material provided to you, and your step-by-step work
+    provide your expert forecast on whether or not the resolution criteria will be achieved and your rationale.
+    Overall "show your work" will be several paragpraphs long.  That's okay -- take your time and write out what you need to write out.
+
+    2) **DETERMINE A FORECAST PROBABLITY** Given the resolution criteria and your rationale,
+    determine the probability (likelihood) that the resolution will be achieved
+    Speciically, what is the probablity the quesiton will resovle {direction}.
+    This is an integer between 0 and 100.
+
+    3) Reflect on how confident you are given the quality of the inputs and the situation
+    at hand in your answer.  Grade your confidence on a scale of 1 to 10, where
+    1 is very low confidence and 10 is very high confidence.
+
+    Output your response in the following JSON structure:
+    {{
+    "show_your_work": "string",
+    "probability": "integer between 0 and 100"
+    "confidence": "integer between 1 and 10"
+    }}
+
+    Thanks for all your hard work.
+    """
+
+OPENAI_FINAL_RATIONALE_PROMPT_TEMPLATE = """
+    I am a professional forecaster and I am about to submit a forecast to a forecasting contest.
+
+    As part of my submission, I have to include a rationale.  Lots of things went into my forecast so
+    I need your help writing the rationale.  The gaol is to explain the reaons why I am submitting the forecast that I am.
+
+    Here is some information about the question.
+
+    The question is:
+    {title}
+
+    Here is some background on the question:
+    {background}
+
+    Here is how the question gets resolved:
+    {resolution_criteria}
+
+    Here is some background news on the question:
+    {hot_news_ranked}
+
+    Here is some research that was done on the question:
+    {one_shot_rschquestion_answer}
+
+    ***The above will serve as useful background***
+
+    My final prediction on this question is: {final_prediction}
+
+    The way I do my forecast is that I have six forecasters develop an answer and then I make a final decision on what to submit.
+    Here are the rationales they submitted:
+
+    Forecaster #1's rationale:
+    {rationale1}
+
+    Forecaster #2's rationale:
+    {rationale2}
+
+    Forecaster #3's rationale:
+    {rationale3}
+
+    Forecaster #4's rationale:
+    {rationale4}
+
+    Forecaster #5's rationale:
+    {rationale5}
+
+    Forecaster #6's rationale:
+    {rationale6}
+
+    Some of these might be blank.  If so, just ignore them.
+
+    Here are your instructions for writting what I need:
+    1) Your answer should be about 500 words.
+    2) It should synthesize the material above into one coherent answer / rationale.
+    3) It should explain why the forecast is what it is with an emphasis on the ***key reasoning***
+    4) Write it from the perspective of "MWG Bot."  Do not say "I" ... say "MWG Bot."
+    5) Do not mention the exact final prediction I am submitted in your paragraph.  That is submitted elsewhere.  This piece should only include the rationale.
+    6) Please put this sentence at the end of your statement: "NOTE: MWG Bot is built in Python using Google Colab Enterprise.
+    It relies upon a variety of tools and services, which the owner of MWG Bot pays for.  It also uses AskNews, NewsCatcher,
+    and The New York Times.  The owners of these three services kindly donate access to MWG Bot.  Thank you to our sponsors!"
+
+    Output your response in the following JSON structure:
+    {{
+    "final_rationale": "string",
+    }}
+
+    Thanks for all your hard work.
+    """
+
+GET_QUESTION_CATEGORIES_TEMPLATE = """
+    I need your help creating groups out of a list of questions.
+
+    This is a list of forecasting questions, each of which will be assigned a probability between 0 and 100.
+
+    Questions should be grouped together if the sum of the probabilities for those questions should not exceed 100.  There are two flavors of these types of situations.  One is a list of questions that is mutually exclusive and collectively exhaustive.  The other is a list of questions that are mutually exclusive but do not include a collectively exhaustive set of answers.  In either case, the sum of the probabilities should not exceed 100 and I need them grouped together.
+
+    Some groups will only contain one question and that is fine – in fact, it’s expected.
+
+    Can you create groups for these questions:
+
+    {titles}
+
+    The group assignment should be an integer and you should start the numbering with 1.
+
+    Output your response in the following JSON structure:
+    {{
+    ID#: "group assignment",
+    ID#: "group assignment",
+    ID#: "group assignment",
+    }}
+
+    Thanks for all your hard work.
+"""
 
 
 class SpringTemplateBot2026(ForecastBot):
@@ -117,59 +907,128 @@ class SpringTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
-    ##################################### RESEARCH #####################################
-    async def run_research(self, question):
-        return ""
+       ##################################### RESEARCH #####################################
 
-    # async def run_research(self, question: MetaculusQuestion) -> str:
-    #     async with self._concurrency_limiter:
-    #         research = ""
-    #         researcher = self.get_llm("researcher")
+    async def run_research(self, question: MetaculusQuestion) -> str:
+        async with self._concurrency_limiter:
+            today = datetime.now().strftime("%Y-%m-%d")
 
-    #         prompt = clean_indents(
-    #             f"""
-    #             You are an assistant to a superforecaster.
-    #             The superforecaster will give you a question they intend to forecast on.
-    #             To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-    #             You do not produce forecasts yourself.
+            # --- HOT NEWS ---
+            asknews = await AskNewsSearcher().invoke(
+                clean_indents(
+                    f"""
+                    {Keyword_Generator}
 
-    #             Question:
-    #             {question.question_text}
+                    Question:
+                    {question.question_text}
+                    """
+                )
+            )
 
-    #             This question's outcome will be determined by the specific criteria below:
-    #             {question.resolution_criteria}
+            hotnews_ranked = await self.get_llm("default", "llm").invoke(
+                clean_indents(
+                    HOTNEWS_RANKED_PROMPT.format(
+                        title=question.question_text,
+                        today=today,
+                        hotnews_asknews_cleaned=asknews,
+                        hotnews_newscatcher_cleaned="",
+                    )
+                )
+            )
 
-    #             {question.fine_print}
-    #             """
-    #         )
+            # --- ONE-SHOT RESEARCH QUESTION ---
+            one_shot_q = await self.get_llm("default", "llm").invoke(
+                clean_indents(
+                    Singleshot_Research_Memo.format(
+                        title=question.question_text,
+                        background=question.background_info,
+                        resolution_criteria=question.resolution_criteria,
+                        fine_print=question.fine_print,
+                        today=today,
+                        hotnews=hotnews_ranked,
+                    )
+                )
+            )
 
-    #         if isinstance(researcher, GeneralLlm):
-    #             research = await researcher.invoke(prompt)
-    #         elif (
-    #             researcher == "asknews/news-summaries"
-    #             or researcher == "asknews/deep-research/low-depth"
-    #             or researcher == "asknews/deep-research/medium-depth"
-    #             or researcher == "asknews/deep-research/high-depth"
-    #         ):
-    #             research = await AskNewsSearcher().call_preconfigured_version(
-    #                 researcher, prompt
-    #             )
-    #         elif researcher.startswith("smart-searcher"):
-    #             model_name = researcher.removeprefix("smart-searcher/")
-    #             searcher = SmartSearcher(
-    #                 model=model_name,
-    #                 temperature=0,
-    #                 num_searches_to_run=2,
-    #                 num_sites_per_search=10,
-    #                 use_advanced_filters=False,
-    #             )
-    #             research = await searcher.invoke(prompt)
-    #         elif not researcher or researcher == "None" or researcher == "no_research":
-    #             research = ""
-    #         else:
-    #             research = await self.get_llm("researcher", "llm").invoke(prompt)
-    #         logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-    #         return research
+            one_shot_a = await AskNewsSearcher().invoke(one_shot_q)
+
+            # --- MULTI-SHOT RESEARCH ---
+            multi_shot_a = await self.get_llm("default", "llm").invoke(
+                clean_indents(
+                    Perplexity_Memo.format(
+                        title=question.question_text,
+                        hotnews=hotnews_ranked,
+                    )
+                )
+            )
+
+            # --- BASERATES ---
+            baserate_qs = await self.get_llm("default", "llm").invoke(
+                clean_indents(
+                    Baserate_Research_Memo.format(
+                        title=question.question_text,
+                        background=question.background_info,
+                        resolution_criteria=question.resolution_criteria,
+                        fine_print=question.fine_print,
+                        today=today,
+                        hotnews=hotnews_ranked,
+                    )
+                )
+            )
+
+            baserate_answers = await AskNewsSearcher().invoke(baserate_qs)
+
+            # --- BACKGROUND ---
+            background_ranked = await self.get_llm("default", "llm").invoke(
+                clean_indents(
+                    BACKGROUND_RANK_PROMPT.format(
+                        title=question.question_text,
+                        today=today,
+                        newscatcher_articles="",
+                        nyt_articles="",
+                        background_asknews=asknews,
+                    )
+                )
+            )
+
+            # --- SCORE RESEARCH ---
+            research_grade = await self.get_llm("default", "llm").invoke(
+                clean_indents(
+                    Score_Overall_Research_Prompt.format(
+                        title=question.question_text,
+                        hot_news_ranked=hotnews_ranked,
+                        background_news_ranked=background_ranked,
+                        one_shot_rschquestion_answer=one_shot_a,
+                        multishot_rschquestion_answer=multi_shot_a,
+                        baserate1=baserate_answers,
+                        baserate2=baserate_answers,
+                        baserate3=baserate_answers,
+                        baserate4=basivalserate_answers,
+                    )
+                )
+            )
+
+            return clean_indents(
+                f"""
+                ## Hot News
+                {hotnews_ranked}
+
+                ## One-Shot Research
+                {one_shot_a}
+
+                ## Multi-Shot Research
+                {multi_shot_a}
+
+                ## Base Rates
+                {baserate_answers}
+
+                ## Background
+                {background_ranked}
+
+                ## Research Evaluation
+                {research_grade}
+                """
+            )
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -726,3 +1585,7 @@ if __name__ == "__main__":
             template_bot.forecast_questions(questions, return_exceptions=True)
         )
     template_bot.log_report_summary(forecast_reports)
+
+    if __name__ == "__main__":
+        test_newscatcher()
+
