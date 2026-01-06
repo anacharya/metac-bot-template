@@ -19,7 +19,7 @@ import sys
 
 from asknews_sdk import AskNewsSDK        
 from openai import OpenAI                 
-from newscatcherapi import NewsCatcherApiClient  
+#from newscatcherapi import NewsCatcherApiClient  
 
 # Load API keys from environment variables
 ASKNEWS_CLIENT_ID = os.environ.get("ASKNEWS_CLIENT_ID")
@@ -33,7 +33,7 @@ PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
 
 def test_newscatcher():
     if not NEWSCATCHER_API_KEY:
-        print("❌ NEWSCATCHER_API_KEY not set")
+        print("NEWSCATCHER_API_KEY not set")
         return
 
     url = "https://api.newscatcherapi.com/v2/search"
@@ -50,11 +50,11 @@ def test_newscatcher():
     
     if response.status_code == 200:
         data = response.json()
-        print("✅ NewsCatcher test successful. Sample articles:")
+        print(" NewsCatcher test successful. Sample articles:")
         for article in data.get("articles", []):
             print("-", article.get("title"))
     else:
-        print(f"❌ NewsCatcher test failed: {response.status_code}")
+        print(f" NewsCatcher test failed: {response.status_code}")
         print(response.text)
 
 
@@ -1005,7 +1005,8 @@ class SpringTemplateBot2026(ForecastBot):
                         baserate1=baserate_answers,
                         baserate2=baserate_answers,
                         baserate3=baserate_answers,
-                        baserate4=basivalserate_answers,
+                        baserate4=baserate_answers,
+
                     )
                 )
             )
@@ -1498,6 +1499,9 @@ class SpringTemplateBot2026(ForecastBot):
 
 
 if __name__ == "__main__":
+
+    test_newscatcher()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1588,6 +1592,4 @@ if __name__ == "__main__":
         )
     template_bot.log_report_summary(forecast_reports)
 
-    if __name__ == "__main__":
-        test_newscatcher()
 
